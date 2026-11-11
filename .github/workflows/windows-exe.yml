@@ -1,0 +1,13 @@
+name: Windows exe
+on: [workflow_dispatch, push]
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11"}
+      - run: pip install -r requirements.txt pyinstaller
+      - run: pyinstaller --onefile --windowed --name Pultit pultit.py
+      - uses: actions/upload-artifact@v4
+        with: {name: Pultit-exe, path: dist/Pultit.exe}
