@@ -3,7 +3,8 @@
 
 Käyttö:  python pultit.py            (avaa graafisen käyttöliittymän)
          python pultit.py bolt M8 --length 40
-         python pultit.py nut M8
+         python pultit.py bolt M8 -l 40 --thread print
+         python pultit.py nut M8 --thread print
          python pultit.py capnut M8
          python pultit.py washer M8
 """
@@ -25,6 +26,18 @@ SIZES = {
     "M10": (1.5, 16.0, 6.4, 8.4, 10.5, 20.0, 2.0),
     "M12": (1.75, 18.0, 7.5, 10.8, 13.0, 24.0, 2.5),
 }
+# Tulostusystävällinen kierre: (nousu, oletustulostusvara).
+# Nousu noin 1.5–2× ISO-karkea. Vara on koon mukaan, jotta kierteeseen jää pitoa
+# (45° kyljillä korkeus on enintään ≈ 0.42 P).
+PRINT_SPEC = {
+    "M3":  (1.00, 0.20),
+    "M4":  (1.25, 0.25),
+    "M5":  (1.50, 0.30),
+    "M6":  (1.75, 0.35),
+    "M8":  (2.00, 0.40),
+    "M10": (2.50, 0.40),
+    "M12": (3.00, 0.40),
+}
 # DIN 1587 hattumutteri: (s, kokonaiskorkeus h, kuusiön korkeus m, kierresyvyys t)
 # HUOM: likimääräiset arvot DIN 1587 -taulukon mukaan
 CAPNUT = {
@@ -33,6 +46,8 @@ CAPNUT = {
     "M10": (16.0, 18.0, 11.0, 13.0), "M12": (18.0, 22.0, 13.0, 16.0),
 }
 N_THETA = 96  # jaollinen 6:lla -> kuusiokulmat osuvat tarkasti verteksiin
+THREAD_MODES = ("iso", "print")
+THREAD_LABELS = {"iso": "ISO (tarkka)", "print": "Tulostusystävällinen"}
 
 
 def _size(name):
@@ -40,6 +55,27 @@ def _size(name):
     if name not in SIZES:
         raise ValueError(f"Tuntematon koko {name}. Vaihtoehdot: {', '.join(SIZES)}")
     return int(name[1:]), SIZES[name]
+
+
+def _mode(name):
+    name = (name or "iso").lower()
+    if name not in THREAD_MODES:
+        raise ValueError(f"Tuntematon kierretyyppi {name}. Vaihtoehdot: iso, print")
+    return name
+
+
+def default_clearance(size, mode="iso"):
+    mode = _mode(mode)
+    if mode == "print":
+        return PRINT_SPEC[size.upper()][1]
+    return 0.2
+
+
+def pitch_of(size, mode="iso"):
+    d, (P_iso, *_rest) = _size(size)
+    if _mode(mode) == "print":
+        return PRINT_SPEC[size.upper()][0]
+    return P_iso
 
 
 def _theta(n=N_THETA):
@@ -52,7 +88,51 @@ def hex_radius(theta, s):
     return (s / 2) / np.cos(a)
 
 
-def thread_radius(theta, z, d, P, external, clearance):
+def print_thread_dims(P):
+    """Puolisuunnikaskierre: 45° kyljet, typistetyt + pyöristetyt harjat/pohjat."""
+    crest_flat = 0.16 * P
+    root_flat = 0.16 * P
+    flank_z = (P - crest_flat - root_flat) / 2
+    height = flank_z  # 45° => dr = dz
+    rf = 0.10 * P
+    return crest_flat, root_flat, flank_z, height, rf
+
+
+def print_thread_radius(theta, z, d, P, external, clearance):
+    """Tulostusystävällinen kierre: 45° kyljet (ylitys ≤ 45° pystyssä tulostettaessa)."""
+    u = np.mod(z - P * theta / (2 * np.pi), P)
+    dist = np.abs(u - P / 2)  # 0 = harjan keski, P/2 = pohjan keski
+    crest_flat, root_flat, flank_z, height, rf = print_thread_dims(P)
+    k = rf * (math.sqrt(2) - 1.0)
+    r_maj = d / 2.0
+    r_min = d / 2.0 - height
+    u_crest = crest_flat / 2.0
+    u_root = u_crest + flank_z
+
+    r = np.where(
+        dist <= u_crest,
+        r_maj,
+        np.where(dist >= u_root, r_min, r_maj - (dist - u_crest)),
+    )
+
+    # Harjan kupera pyöristys (keskipiste kappaleen sisällä)
+    uc = u_crest - k
+    rc = r_maj - rf
+    in_crest = (dist >= uc) & (dist <= uc + rf / math.sqrt(2))
+    r = np.where(in_crest, rc + np.sqrt(np.maximum(rf ** 2 - (dist - uc) ** 2, 0.0)), r)
+
+    # Pohjan kovera pyöristys (keskipiste uran puolella)
+    ur = u_root + k
+    rr = r_min + rf
+    in_root = (dist >= ur - rf / math.sqrt(2)) & (dist <= ur)
+    r = np.where(in_root, rr - np.sqrt(np.maximum(rf ** 2 - (dist - ur) ** 2, 0.0)), r)
+
+    if external:
+        return r - clearance / 2.0
+    return r + clearance / 2.0
+
+
+def iso_thread_radius(theta, z, d, P, external, clearance):
     """ISO-metrisen 60° kierreprofiilin säde (z, theta) pisteessä. Oikeakätinen."""
     H = math.sqrt(3) / 2 * P
     u = np.mod(z - P * theta / (2 * np.pi), P)
@@ -64,6 +144,23 @@ def thread_radius(theta, z, d, P, external, clearance):
     else:
         r = np.clip(r, d / 2 - 5 * H / 8, d / 2) + clearance / 2
     return r
+
+
+def thread_radius(theta, z, d, P, external, clearance, mode="iso"):
+    if _mode(mode) == "print":
+        return print_thread_radius(theta, z, d, P, external, clearance)
+    return iso_thread_radius(theta, z, d, P, external, clearance)
+
+
+def thread_root_radius(d, P, clearance, mode, external=True):
+    """Kierteen pohjan säde (ulko- tai sisäpuolinen)."""
+    if _mode(mode) == "print":
+        height = print_thread_dims(P)[3]
+        r = d / 2.0 - height
+    else:
+        H = math.sqrt(3) / 2 * P
+        r = d / 2 - (17 * H / 24 if external else 5 * H / 8)
+    return r - clearance / 2 if external else r + clearance / 2
 
 
 def _rings_to_xyz(theta, rings):
@@ -97,8 +194,12 @@ def _zsamples(z0, z1, step):
     return np.linspace(z0, z1, n + 1)
 
 
-def make_bolt(size, length, thread_length=None, clearance=0.2, head_chamfer=True):
-    d, (P, s, k, *_rest) = _size(size)
+def make_bolt(size, length, thread_length=None, clearance=None, head_chamfer=True, mode="iso"):
+    mode = _mode(mode)
+    d, (P_iso, s, k, *_rest) = _size(size)
+    P = pitch_of(size, mode)
+    if clearance is None:
+        clearance = default_clearance(size, mode)
     if length <= 0:
         raise ValueError("Pituuden täytyy olla > 0")
     if thread_length is None or thread_length > length:
@@ -116,20 +217,28 @@ def make_bolt(size, length, thread_length=None, clearance=0.2, head_chamfer=True
     ztip = k + length
     zthr0 = ztip - thread_length
     r_shank = d / 2 - clearance / 2
-    r_root = d / 2 - 17 * (math.sqrt(3) / 2 * P) / 24 - clearance / 2
+    r_root = thread_root_radius(d, P, clearance, mode, external=True)
     zs = []
     if zthr0 > k:
         zs += list(_zsamples(k, zthr0, P / 2))
     zs += list(_zsamples(max(zthr0, k), ztip, zstep))
     zs = np.unique(np.round(zs, 9))
+    # Tulostustilassa pidempi 45° sisäänmeno kärjessä ja kierteen alussa
+    tip_len = max(r_shank - r_root, 0.75 * P if mode == "print" else 0.0)
+    runout = 1.0 if mode == "print" else 2.0  # dr/dz; 1 => 45°
     for z in zs:
         if z < zthr0 - 1e-9:
             r = np.full_like(th, r_shank)
         else:
-            r = thread_radius(th, z, d, P, True, clearance)
-            r = np.minimum(r, np.maximum(r_shank, d / 2) )
-            r = np.minimum(r, r_root + (ztip - z))          # 45° kärkiviiste
-            r = np.minimum(r, r_shank + (z - zthr0) * 2) if zthr0 > k else r  # kierteen loppu
+            r = thread_radius(th, z, d, P, True, clearance, mode)
+            r = np.minimum(r, np.maximum(r_shank, d / 2))
+            r = np.minimum(r, r_root + (ztip - z) * (r_shank - r_root) / max(tip_len, 1e-9))
+            if tip_len > r_shank - r_root:
+                # 45° viiste kärjessä koko tip_len-matkalta
+                r = np.minimum(r, r_shank + (ztip - z) - tip_len + (r_shank - r_root))
+                r = np.minimum(r, r_shank + (ztip - z))
+            if zthr0 > k:
+                r = np.minimum(r, r_shank + (z - zthr0) * runout)
         rings.append((z, r))
     V = _rings_to_xyz(th, rings).reshape(-1, 3)
     nr, nt = len(rings), len(th)
@@ -156,8 +265,12 @@ def _ring_part(th, outer_rings, inner_rings):
     return trimesh.Trimesh(np.vstack([Vo, Vi]), np.concatenate(F), process=True)
 
 
-def make_nut(size, clearance=0.2):
-    d, (P, s, _k, m, *_r) = _size(size)
+def make_nut(size, clearance=None, mode="iso"):
+    mode = _mode(mode)
+    d, (P_iso, s, _k, m, *_r) = _size(size)
+    P = pitch_of(size, mode)
+    if clearance is None:
+        clearance = default_clearance(size, mode)
     th = _theta()
     outer = []
     for z in _zsamples(0, m, m / 12):
@@ -165,17 +278,23 @@ def make_nut(size, clearance=0.2):
         dist = min(z, m - z)
         r = np.minimum(r, s / 2 * 0.98 + dist * math.sqrt(3))  # 30° viisteet
         outer.append((z, r))
+    chamfer = min(0.5 * P, 0.22 * m) if mode == "print" else 0.1 * P
+    r_bore = d / 2 + clearance / 2  # sisäkierteen pohja (suurin reikä ilman viistettä)
     inner = []
     for z in _zsamples(0, m, P / 16):
-        r = thread_radius(th, z, d, P, False, clearance)
+        r = thread_radius(th, z, d, P, False, clearance, mode)
         dist = min(z, m - z)
-        r = np.maximum(r, d / 2 + clearance / 2 + 0.1 * P - dist)  # sisäviisteet
+        r = np.maximum(r, r_bore + chamfer - dist)  # sisäänmeno, 45° tulostustilassa
         inner.append((z, r))
     return _ring_part(th, outer, inner)
 
 
-def make_capnut(size, clearance=0.2):
-    d, (P, *_r) = _size(size)
+def make_capnut(size, clearance=None, mode="iso"):
+    mode = _mode(mode)
+    d, (P_iso, *_r) = _size(size)
+    P = pitch_of(size, mode)
+    if clearance is None:
+        clearance = default_clearance(size, mode)
     s, h, m, t = CAPNUT[size.upper()]
     th = _theta()
     nt = len(th)
@@ -191,13 +310,22 @@ def make_capnut(size, clearance=0.2):
         z = zc + R * math.sin(a)
         if z > m:
             outer.append((z, np.full_like(th, R * math.cos(a))))
+    chamfer = 0.5 * P if mode == "print" else 0.1 * P
+    r_bore = d / 2 + clearance / 2
     inner = []
-    for z in _zsamples(0, t, P / 16):
-        r = thread_radius(th, z, d, P, False, clearance)
-        r = np.maximum(r, d / 2 + clearance / 2 + 0.1 * P - z)
+    zs_th = _zsamples(0, t, P / 16)
+    for z in zs_th:
+        r = thread_radius(th, z, d, P, False, clearance, mode)
+        r = np.maximum(r, r_bore + chamfer - z)
         inner.append((z, r))
-    rd = d / 2 - 5 * math.sqrt(3) / 2 * P / 8 + clearance / 2 - 0.05  # poran säde
-    inner.append((t, np.full_like(th, rd)))
+    # Poran säde hieman sisäkierteen pohjaa (pienin r) pienempi, umpinainen pohja
+    rd = thread_root_radius(d, P, clearance, mode, external=False) - 0.08
+    if abs(inner[-1][0] - t) < 1e-12:
+        # sama z kuin viimeinen kierresilmukka: vain jos rd on selvästi pienempi
+        inner.append((t, np.full_like(th, min(rd, np.min(inner[-1][1]) - 0.04))))
+    else:
+        inner.append((t, np.full_like(th, rd)))
+    rd = inner[-1][1][0]
     for f in (0.66, 0.33):
         inner.append((t + (1 - f) * rd * math.tan(math.radians(31)), np.full_like(th, rd * f)))
     apex_in = t + rd * math.tan(math.radians(31))
@@ -215,27 +343,41 @@ def make_capnut(size, clearance=0.2):
     return trimesh.Trimesh(V, np.concatenate(F), process=True)
 
 
-def make_washer(size, clearance=0.2):
+def make_washer(size, clearance=None, mode="iso"):
     _d, (*_x, d1, d2, h) = _size(size)
+    if clearance is None:
+        clearance = 0.2
     th = _theta()
     outer = [(0, np.full_like(th, d2 / 2)), (h, np.full_like(th, d2 / 2))]
     inner = [(0, np.full_like(th, d1 / 2 + clearance / 2)), (h, np.full_like(th, d1 / 2 + clearance / 2))]
     return _ring_part(th, outer, inner)
 
 
-def generate(kind, size, length=None, thread_length=None, clearance=0.2, out=None):
+def _name_suffix(mode, kind):
+    if kind != "washer" and _mode(mode) == "print":
+        return "_tulostus"
+    return ""
+
+
+def generate(kind, size, length=None, thread_length=None, clearance=None, out=None, mode="iso"):
     size = size.upper()
+    mode = _mode(mode)
+    if clearance is None and kind != "washer":
+        clearance = default_clearance(size, mode)
+    elif clearance is None:
+        clearance = 0.2
+    suf = _name_suffix(mode, kind)
     if kind == "bolt":
         if not length:
             raise ValueError("Pultille pitää antaa pituus")
-        mesh = make_bolt(size, length, thread_length, clearance)
-        default = f"pultti_{size}x{length:g}.stl"
+        mesh = make_bolt(size, length, thread_length, clearance, mode=mode)
+        default = f"pultti_{size}x{length:g}{suf}.stl"
     elif kind == "nut":
-        mesh = make_nut(size, clearance)
-        default = f"mutteri_{size}.stl"
+        mesh = make_nut(size, clearance, mode=mode)
+        default = f"mutteri_{size}{suf}.stl"
     elif kind == "capnut":
-        mesh = make_capnut(size, clearance)
-        default = f"hattumutteri_{size}.stl"
+        mesh = make_capnut(size, clearance, mode=mode)
+        default = f"hattumutteri_{size}{suf}.stl"
     elif kind == "washer":
         mesh = make_washer(size, clearance)
         default = f"aluslevy_{size}.stl"
@@ -259,36 +401,79 @@ def run_gui():
     v_size = tk.StringVar(value="M8")
     v_len = tk.StringVar(value="30")
     v_thr = tk.StringVar(value="")
+    v_mode = tk.StringVar(value=THREAD_LABELS["iso"])
     v_clr = tk.StringVar(value="0.2")
+    last_auto = [0.2]
 
+    mode_box = ttk.Combobox(frm, textvariable=v_mode, values=list(THREAD_LABELS.values()), state="readonly")
     rows = [("Tyyppi:", ttk.Combobox(frm, textvariable=v_kind, values=list(kinds), state="readonly")),
             ("Koko:", ttk.Combobox(frm, textvariable=v_size, values=list(SIZES), state="readonly")),
+            ("Kierretyyppi:", mode_box),
             ("Pultin pituus (mm):", ttk.Entry(frm, textvariable=v_len)),
             ("Kierteen pituus (mm, tyhjä = koko pituus):", ttk.Entry(frm, textvariable=v_thr)),
             ("Tulostusvara / toleranssi (mm):", ttk.Entry(frm, textvariable=v_clr))]
     for i, (lbl, w) in enumerate(rows):
-        ttk.Label(frm, text=lbl).grid(row=i, column=0, sticky="w", pady=3)
+        ttk.Label(frm, text=lbl).grid(row=i, column=0, sticky="w", pady=3, padx=(0, 10))
         w.grid(row=i, column=1, sticky="ew", pady=3)
+    frm.columnconfigure(1, weight=1)
+    root.minsize(540, 400)
+    root.geometry("580x440")
+    note = ttk.Label(
+        frm,
+        text="Tulostusystävällinen kierre ei sovi tavallisiin ISO-pultteihin tai -muttereihin.\n"
+             "Käytä samaa kierretyyppiä pultissa ja mutterissa.",
+        wraplength=520,
+        foreground="#333",
+    )
+    note.grid(row=len(rows), column=0, columnspan=2, sticky="w", pady=(4, 2))
+
+    def current_mode():
+        return "print" if v_mode.get() == THREAD_LABELS["print"] else "iso"
+
+    def current_default():
+        if v_kind.get() == "Aluslevy":
+            return 0.2
+        return default_clearance(v_size.get(), current_mode())
 
     def toggle(*_):
-        st = "normal" if v_kind.get() == "Pultti" else "disabled"
-        rows[2][1].config(state=st); rows[3][1].config(state=st)
+        is_bolt = v_kind.get() == "Pultti"
+        is_washer = v_kind.get() == "Aluslevy"
+        rows[3][1].config(state="normal" if is_bolt else "disabled")
+        rows[4][1].config(state="normal" if is_bolt else "disabled")
+        mode_box.config(state="disabled" if is_washer else "readonly")
+        try:
+            cur = float(v_clr.get().replace(",", "."))
+        except ValueError:
+            cur = last_auto[0]
+        new_def = current_default()
+        if abs(cur - last_auto[0]) < 1e-9:
+            v_clr.set(str(new_def) if new_def != int(new_def) else str(int(new_def)))
+            # pidä yksi desimaali
+            v_clr.set(f"{new_def:g}")
+        last_auto[0] = new_def
+
     v_kind.trace_add("write", toggle)
+    v_size.trace_add("write", toggle)
+    v_mode.trace_add("write", toggle)
 
     def create():
         try:
             kind = kinds[v_kind.get()]
+            mode = current_mode()
             length = float(v_len.get().replace(",", ".")) if kind == "bolt" else None
             thr = float(v_thr.get().replace(",", ".")) if (kind == "bolt" and v_thr.get().strip()) else None
             clr = float(v_clr.get().replace(",", "."))
-            name = {"bolt": f"pultti_{v_size.get()}x{length:g}" if length else "",
-                    "nut": f"mutteri_{v_size.get()}", "capnut": f"hattumutteri_{v_size.get()}", "washer": f"aluslevy_{v_size.get()}"}[kind]
+            suf = _name_suffix(mode, kind)
+            name = {"bolt": f"pultti_{v_size.get()}x{length:g}{suf}" if length else "",
+                    "nut": f"mutteri_{v_size.get()}{suf}",
+                    "capnut": f"hattumutteri_{v_size.get()}{suf}",
+                    "washer": f"aluslevy_{v_size.get()}"}[kind]
             path = filedialog.asksaveasfilename(defaultextension=".stl", initialfile=name + ".stl",
                                                 filetypes=[("STL-tiedosto", "*.stl")])
             if not path:
                 return
             root.config(cursor="watch"); root.update()
-            out, mesh = generate(kind, v_size.get(), length, thr, clr, path)
+            out, mesh = generate(kind, v_size.get(), length, thr, clr, path, mode=mode)
             ext = mesh.extents
             messagebox.showinfo("Valmis", f"Tallennettu:\n{out}\n\nMitat: {ext[0]:.1f} × {ext[1]:.1f} × {ext[2]:.1f} mm\n"
                                           f"Umpinainen (watertight): {'kyllä' if mesh.is_watertight else 'EI'}")
@@ -297,7 +482,7 @@ def run_gui():
         finally:
             root.config(cursor="")
 
-    ttk.Button(frm, text="Luo STL…", command=create).grid(row=len(rows), column=0, columnspan=2, pady=10)
+    ttk.Button(frm, text="Luo STL…", command=create).grid(row=len(rows) + 1, column=0, columnspan=2, pady=10)
     root.mainloop()
 
 
@@ -310,13 +495,16 @@ def main(argv=None):
     p.add_argument("size", help="Koko: " + ", ".join(SIZES))
     p.add_argument("--length", "-l", type=float, help="Pultin varren pituus mm (kannan alta)")
     p.add_argument("--thread-length", "-t", type=float, help="Kierteen pituus mm (oletus: koko pituus)")
-    p.add_argument("--clearance", "-c", type=float, default=0.2, help="Tulostusvara mm (oletus 0.2)")
+    p.add_argument("--thread", choices=["iso", "print"], default="iso",
+                   help="Kierreprofiili: iso (oletus, tarkka 60°) tai print (tulostusystävällinen)")
+    p.add_argument("--clearance", "-c", type=float, default=None,
+                   help="Tulostusvara mm (oletus 0.2 iso, 0.2–0.4 print koon mukaan)")
     p.add_argument("--output", "-o", help="Tiedostonimi")
     a = p.parse_args(argv)
-    out, mesh = generate(a.kind, a.size, a.length, a.thread_length, a.clearance, a.output)
+    out, mesh = generate(a.kind, a.size, a.length, a.thread_length, a.clearance, a.output, mode=a.thread)
     e = mesh.extents
     print(f"Tallennettu {out}  ({e[0]:.2f} x {e[1]:.2f} x {e[2]:.2f} mm, "
-          f"{len(mesh.faces)} kolmiota, watertight={mesh.is_watertight})")
+          f"{len(mesh.faces)} kolmiota, watertight={mesh.is_watertight}, kierre={a.thread})")
 
 
 if __name__ == "__main__":
